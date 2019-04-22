@@ -47,6 +47,7 @@ import io.vertx.core.AsyncResult;
 import io.vertx.core.DeploymentOptions;
 import io.vertx.core.Future;
 import io.vertx.core.Handler;
+import io.vertx.core.MultiMap;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.eventbus.Message;
 import io.vertx.core.eventbus.ReplyException;
@@ -200,6 +201,10 @@ public class PixelBufferMicroserviceVerticle extends AbstractVerticle {
         router.get(
                 "/zip/:imageId")
             .handler(this::getZippedFiles);
+
+        router.get(
+                "/zipMultiple")
+            .handler(this::getZippedFilesMultiple);
 
         int port = config.getInteger("port");
         log.info("Starting HTTP server *:{}", port);
@@ -417,6 +422,60 @@ public class PixelBufferMicroserviceVerticle extends AbstractVerticle {
                             if (!zipFile.delete()) {
                                 log.error("Failed to delete file " + filePath);
                             }
+                        }
+                    });
+                }
+            }
+        );
+    }
+
+    /*
+     *
+     */
+
+    private void getZippedFilesMultiple(RoutingContext event) {
+        log.info("Get Zipped Files");
+        HttpServerRequest request = event.request();
+        HttpServerResponse response = event.response();
+        String sessionKey = event.get("omero.session_key");
+        MultiMap params = request.params();
+        List<String> imageIdStrings = params.getAll("image");
+        JsonArray imageIds = new JsonArray();
+        JsonObject data = new JsonObject();
+        for (String idStr : imageIdStrings) {
+            imageIds.add(Long.parseLong(idStr));
+        }
+        data.put("sessionKey", sessionKey);
+        data.put("imageIds", imageIds);
+        data.put("zipDirectory", zipDirectory);
+        vertx.eventBus().<JsonObject>send(
+            PixelBufferVerticle.GET_ZIPPED_FILES_MULTIPLE_EVENT,
+            data, new Handler<AsyncResult<Message<JsonObject>>>() {
+                @Override
+                public void handle(AsyncResult<Message<JsonObject>> result) {
+                    if (result.failed()) {
+                        log.error(result.cause().getMessage());
+                        response.setStatusCode(404);
+                        response.end("Could not get zipped files "
+                                    + request.getParam("annotationId"));
+                        return;
+                    }
+                    JsonObject resultBody = result.result().body();
+                    String zipName = resultBody.getString("zipName");
+                    log.info(zipName);
+                    response.headers().set("Content-Type", "application/zip");
+                    response.headers().set("Content-Disposition",
+                            "attachment; filename=\"" + zipName + "\"");
+                    File zipFile = new File(zipName);
+                    response.sendFile(zipFile.getAbsolutePath(), new Handler<AsyncResult<Void>>() {
+                        public void handle(AsyncResult<Void> result) {
+                            File zipFile = new File(zipName);
+                            log.info("Attempting to delete: " + zipFile.getAbsolutePath());
+                            /*
+                            if (!zipFile.delete()) {
+                                log.error("Failed to delete file " + zipName);
+                            }
+                            */
                         }
                     });
                 }

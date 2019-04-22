@@ -26,9 +26,17 @@ import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.ObjectInputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+import java.util.ArrayDeque;
+import java.util.Deque;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.BiConsumer;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
@@ -83,6 +91,9 @@ public class PixelBufferVerticle extends AbstractVerticle {
 
     public static final String GET_ZIPPED_FILES_EVENT =
             "omero.pixel_buffer.get_zipped_files";
+
+    public static final String GET_ZIPPED_FILES_MULTIPLE_EVENT =
+            "omero.pixel_buffer.get_zipped_files_multiple";
 
     private static final String GET_OBJECT_EVENT =
             "omero.get_object";
@@ -139,6 +150,9 @@ public class PixelBufferVerticle extends AbstractVerticle {
 
         vertx.eventBus().<JsonObject>consumer(
                 GET_ZIPPED_FILES_EVENT, this::getZippedFiles);
+
+        vertx.eventBus().<JsonObject>consumer(
+                GET_ZIPPED_FILES_MULTIPLE_EVENT, this::getZippedFilesMultiple);
     }
 
     private void getTile(Message<String> message) {
@@ -403,4 +417,257 @@ public class PixelBufferVerticle extends AbstractVerticle {
             }
         });
     }
+
+    public static boolean createZipDir(String tempZipDir,
+            String zipName) {
+        try {
+            FileOutputStream fos = new FileOutputStream(zipName);
+            ZipOutputStream zipOut = new ZipOutputStream(fos);
+            File fileToZip = new File(tempZipDir);
+
+            zipFile(fileToZip, fileToZip.getName(), zipOut);
+            zipOut.close();
+            fos.close();
+            return true;
+        } catch (IOException e) {
+            log.error(e.getMessage());
+            return false;
+        }
+    }
+
+    private static void zipFile(File fileToZip, String fileName, ZipOutputStream zipOut) throws IOException {
+        if (fileToZip.isHidden()) {
+            return;
+        }
+        if (fileToZip.isDirectory()) {
+            if (fileName.endsWith("/")) {
+                zipOut.putNextEntry(new ZipEntry(fileName));
+                zipOut.closeEntry();
+            } else {
+                zipOut.putNextEntry(new ZipEntry(fileName + "/"));
+                zipOut.closeEntry();
+            }
+            File[] children = fileToZip.listFiles();
+            for (File childFile : children) {
+                zipFile(childFile, fileName + "/" + childFile.getName(), zipOut);
+            }
+            return;
+        }
+        FileInputStream fis = new FileInputStream(fileToZip);
+        ZipEntry zipEntry = new ZipEntry(fileName);
+        zipOut.putNextEntry(zipEntry);
+        byte[] bytes = new byte[1024];
+        int length;
+        while ((length = fis.read(bytes)) >= 0) {
+            zipOut.write(bytes, 0, length);
+        }
+        fis.close();
+    }
+
+    private String getTargetPath(String filePath, String fileName, String templatePrefix) {
+        log.info("templatePrefix: " + templatePrefix);
+        Path fpath = Paths.get(filePath);
+        Path parent = fpath.getParent();
+        String parentStr = parent.toString();
+        if (parentStr.equals(templatePrefix) || templatePrefix.equals("")) {
+            return fileName;
+        }
+        String relPath = new File(templatePrefix).toURI().relativize(new File(parentStr).toURI()).getPath();
+        Path path = Paths.get(relPath);
+        return path.resolve(fileName).toString();
+    }
+
+    private void getZippedFilesHelper(Message<JsonObject> message,
+            Deque<Long> remainingImageIds,
+            String tempZipDir,
+            String zipName,
+            Set<Long> usedFilesetIds,
+            Set<Long> usedFileIds) {
+        if(remainingImageIds.size() == 0) {
+            //Zip the files and respond to the message
+            boolean success = createZipDir(tempZipDir, zipName);
+            if (success) {
+                JsonObject pathObj = new JsonObject();
+                pathObj.put("zipName", zipName);
+                message.reply(pathObj);
+            }
+            else {
+                message.fail(404, "Error creating zip");
+            }
+            return;
+        }
+
+        Long imageId = remainingImageIds.pop();
+        JsonObject messageBody = message.body();
+        String sessionKey = messageBody.getString("sessionKey");
+        //Get the image
+        final JsonObject getImageData = new JsonObject();
+        getImageData.put("sessionKey", sessionKey);
+        getImageData.put("id", imageId);
+        getImageData.put("type", "Image");
+        vertx.eventBus().<byte[]>send(GET_OBJECT_EVENT, getImageData, getImageResult -> {
+            try {
+                if (getImageResult.failed()) {
+                    log.error(getImageResult.cause().getMessage());
+                    message.reply("Failed to get image");
+                    return;
+                }
+                Image thisImage = deserialize(getImageResult);
+                Long fsId = thisImage.getFileset().getId();
+                //If we've already processed this fileset, move on
+                if (usedFilesetIds.contains(fsId)) {
+                    getZippedFilesHelper(message,
+                            remainingImageIds,
+                            tempZipDir,
+                            zipName,
+                            usedFilesetIds,
+                            usedFileIds);
+                    return;
+                }
+                //Get the fileset
+                final JsonObject getFilesetData = new JsonObject();
+                getFilesetData.put("sessionKey", sessionKey);
+                getFilesetData.put("id", fsId);
+                getFilesetData.put("type", "Fileset");
+                vertx.eventBus().<byte[]>send(GET_OBJECT_EVENT, getFilesetData, getFilesetResult -> {
+                    try {
+                        if (getFilesetResult.failed()) {
+                            log.error(getFilesetResult.cause().getMessage());
+                            message.reply("Failed to get image");
+                            return;
+                        }
+                        Fileset thisFileset = deserialize(getFilesetResult);
+                        String templatePrefix = thisFileset.getTemplatePrefix();
+                        //Get OriginalFiles for Image
+                        final JsonObject getImportedImageFilesData = new JsonObject();
+                        getImportedImageFilesData.put("sessionKey", sessionKey);
+                        getImportedImageFilesData.put("imageId", imageId);
+                        vertx.eventBus().<byte[]>send(GET_IMPORTED_IMAGE_FILES_EVENT, getImportedImageFilesData, getImportedFilesResult -> {
+                            try {
+                                if (getImportedFilesResult.failed()) {
+                                    log.error(getImportedFilesResult.cause().getMessage());
+                                    message.reply("Failed to get image");
+                                    return;
+                                }
+                                List<OriginalFile> originalFiles = deserialize(getImportedFilesResult);
+                                log.info(String.valueOf(originalFiles.size()));
+                                JsonArray fileIds = new JsonArray();
+                                for (OriginalFile of : originalFiles) {
+                                    fileIds.add(of.getId());
+                                }
+                                final JsonObject filepathData = new JsonObject();
+                                filepathData.put("sessionKey", sessionKey);
+                                filepathData.put("originalFileIds", fileIds);
+                                //Get File Paths for OriginalFiles
+                                log.info("Getting OriginalFile Paths");
+                                vertx.eventBus().<byte[]>send(
+                                        GET_ORIGINAL_FILE_PATHS_EVENT, filepathData, filePathResult -> {
+                                    try {
+                                        if (filePathResult.failed()) {
+                                            log.error(filePathResult.cause().getMessage());
+                                            message.fail(404, "Failed to get file path");
+                                            return;
+                                        }
+                                        String newDir = "";
+                                        final List<String> filePaths = deserialize(filePathResult);
+                                        for (String fpath : filePaths) {
+                                            String fileName = fpath.split("/")[fpath.split("/").length - 1];
+                                            String targetPath = getTargetPath(fpath, fileName, templatePrefix);
+                                            File baseFile = new File(tempZipDir + "/" + fpath.split("/")[0]);
+                                            log.info(baseFile.toString());
+                                            if (baseFile.exists()){
+                                                Integer newDirIdx = 0;
+                                                File baseTest = new File(tempZipDir
+                                                        + "/"
+                                                        + newDirIdx.toString()
+                                                        + "/"
+                                                        + fpath.split("/")[0]);
+                                                while(baseTest.exists()) {
+                                                    newDirIdx += 1;
+                                                    baseTest = new File(tempZipDir
+                                                            + "/"
+                                                            + newDirIdx.toString()
+                                                            + "/"
+                                                            + fpath.split("/")[0]);
+                                                }
+                                                newDir = newDirIdx.toString();
+                                                break;
+                                            }
+                                        }
+
+                                        //Copy each file into the temp zip dir
+                                        String newZipName = zipName;
+                                        for (String fpath : filePaths) {
+                                            //TODO: Check for duplicate Omero 4.4 images
+                                            String fileName = fpath.split("/")[fpath.split("/").length - 1];
+                                            String temp_f = getTargetPath(fpath, fileName, templatePrefix);
+                                            Path tempfPath = Paths.get(tempZipDir, newDir, temp_f);
+                                            File temp_d = new File(tempfPath.getParent().toString());
+                                            if (!temp_d.exists()) {
+                                                temp_d.mkdirs();
+                                            }
+                                            /*
+                                             * Need to be sure that the zip name does not match any file
+                                             * within it since OS X will unzip as a single file instead
+                                             * of a directory
+                                             */
+                                            if (newZipName == fileName + ".zip") {
+                                                newZipName = fileName + "_folder.zip";
+                                            }
+
+                                            Path originalPath = Paths.get(fpath);
+                                            log.info("Copying " + originalPath.toString() + " to " + tempfPath.toString());
+                                            Files.copy(originalPath, tempfPath, StandardCopyOption.REPLACE_EXISTING);
+                                        }
+
+                                        getZippedFilesHelper(message,
+                                            remainingImageIds,
+                                            tempZipDir,
+                                            newZipName,
+                                            usedFilesetIds,
+                                            usedFileIds);
+                                    } catch (IOException | ClassNotFoundException e) {
+                                        log.error("Exception while decoding object in response", e);
+                                        message.fail(404, "Error decoding file path object");
+                                    }
+                                });
+                            } catch (IOException | ClassNotFoundException e) {
+
+                            }
+                        });
+                    } catch (IOException | ClassNotFoundException e) {
+
+                    }
+                });
+            } catch (IOException | ClassNotFoundException e) {
+
+            }
+        });
+
+    }
+
+    private void getZippedFilesMultiple(Message<JsonObject> message) {
+        JsonObject messageBody = message.body();
+        String sessionKey = messageBody.getString("sessionKey");
+        JsonArray imageIdArray = messageBody.getJsonArray("imageIds");
+        Deque<Long> remainingImageIds = new ArrayDeque<Long>(imageIdArray.size());
+        for(int i = 0; i < imageIdArray.size(); i++) {
+            remainingImageIds.add(imageIdArray.getLong(i));
+        }
+
+        log.info(remainingImageIds.toString());
+
+        String tempZipDir = "testTmpZipDir";
+        String zipName = "testZip.zip";
+        Set<Long> usedFilesetIds = new HashSet<Long>();
+        Set<Long> usedFileIds = new HashSet<Long>();
+
+        getZippedFilesHelper(message,
+                remainingImageIds,
+                tempZipDir,
+                zipName,
+                usedFilesetIds,
+                usedFileIds);
+    }
+
 }
