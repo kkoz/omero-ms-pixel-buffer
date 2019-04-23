@@ -31,6 +31,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Deque;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -381,19 +382,22 @@ public class PixelBufferVerticle extends AbstractVerticle {
                             message.fail(404, "Failed to get file path");
                             return;
                         }
-                        final List<String> filePaths = deserialize(filePathResult);
-                        for (String fp : filePaths) {
-                            log.info(fp);
+                        final JsonObject filePathResultObj = deserialize(filePathResult);
+                        final JsonArray filePathArray = filePathResultObj.getJsonArray("paths");
+                        final String managedRepositoryRoot = filePathResultObj.getString("managedRepositoryRoot");
+                        final List<String> filePaths = new ArrayList<String>(filePathArray.size());
+                        for(int i = 0; i < filePathArray.size(); i++) {
+                            filePaths.add(filePathArray.getString(i));
                         }
                         String zipName = "image" + imageId.toString() + ".zip";
-                        String zipFullPath = zipDirectory + "/" + zipName;
+                        String zipFullPath = zipDirectory + File.separator + zipName;
                         File zipFile = new File(zipFullPath);
                         int fileIndex = 1;
                         while (zipFile.exists()) {
                             log.info("Zip name collision: " + zipFullPath);
                             zipName = "image" + imageId.toString()
                                        + "_" + String.valueOf(fileIndex) + ".zip";
-                            zipFullPath = zipDirectory + "/" + zipName;
+                            zipFullPath = zipDirectory + File.separator + zipName;
                             zipFile = new File(zipFullPath);
                         }
                         boolean success = createZip(zipFullPath, filePaths);
@@ -440,16 +444,16 @@ public class PixelBufferVerticle extends AbstractVerticle {
             return;
         }
         if (fileToZip.isDirectory()) {
-            if (fileName.endsWith("/")) {
+            if (fileName.endsWith(File.separator)) {
                 zipOut.putNextEntry(new ZipEntry(fileName));
                 zipOut.closeEntry();
             } else {
-                zipOut.putNextEntry(new ZipEntry(fileName + "/"));
+                zipOut.putNextEntry(new ZipEntry(fileName + File.separator));
                 zipOut.closeEntry();
             }
             File[] children = fileToZip.listFiles();
             for (File childFile : children) {
-                zipFile(childFile, fileName + "/" + childFile.getName(), zipOut);
+                zipFile(childFile, fileName + File.separator + childFile.getName(), zipOut);
             }
             return;
         }
@@ -464,15 +468,18 @@ public class PixelBufferVerticle extends AbstractVerticle {
         fis.close();
     }
 
-    private String getTargetPath(String filePath, String fileName, String templatePrefix) {
-        log.info("templatePrefix: " + templatePrefix);
+    private String getTargetPath(String filePath,
+                                 String fileName,
+                                 String templatePrefix,
+                                 String managedRepositoryRoot) {
+        Path rootPath = Paths.get(managedRepositoryRoot, templatePrefix);
         Path fpath = Paths.get(filePath);
         Path parent = fpath.getParent();
         String parentStr = parent.toString();
-        if (parentStr.equals(templatePrefix) || templatePrefix.equals("")) {
+        if (parentStr.equals(rootPath.toString()) || templatePrefix.equals("")) {
             return fileName;
         }
-        String relPath = new File(templatePrefix).toURI().relativize(new File(parentStr).toURI()).getPath();
+        String relPath = rootPath.toUri().relativize(new File(parentStr).toURI()).getPath();
         Path path = Paths.get(relPath);
         return path.resolve(fileName).toString();
     }
@@ -569,26 +576,39 @@ public class PixelBufferVerticle extends AbstractVerticle {
                                             return;
                                         }
                                         String newDir = "";
-                                        final List<String> filePaths = deserialize(filePathResult);
+                                        String jsonString = deserialize(filePathResult);
+                                        final JsonObject filePathResultObj = new JsonObject(jsonString);
+                                        final JsonArray filePathArray = filePathResultObj.getJsonArray("paths");
+                                        final String managedRepositoryRoot = filePathResultObj.getString("managedRepositoryRoot");
+                                        log.info("Managed Repo Root: " + managedRepositoryRoot);
+                                        final List<String> filePaths = new ArrayList<String>(filePathArray.size());
+                                        for(int i = 0; i < filePathArray.size(); i++) {
+                                            filePaths.add(filePathArray.getString(i));
+                                        }
                                         for (String fpath : filePaths) {
-                                            String fileName = fpath.split("/")[fpath.split("/").length - 1];
-                                            String targetPath = getTargetPath(fpath, fileName, templatePrefix);
-                                            File baseFile = new File(tempZipDir + "/" + fpath.split("/")[0]);
+                                            String fileName = fpath.split(File.separator)[fpath.split(File.separator).length - 1];
+                                            String targetPath = getTargetPath(fpath,
+                                                                              fileName,
+                                                                              templatePrefix,
+                                                                              managedRepositoryRoot);
+                                            File baseFile = new File(tempZipDir
+                                                            + File.separator
+                                                            + targetPath.split(File.separator)[0]);
                                             log.info(baseFile.toString());
                                             if (baseFile.exists()){
                                                 Integer newDirIdx = 0;
                                                 File baseTest = new File(tempZipDir
-                                                        + "/"
+                                                        + File.separator
                                                         + newDirIdx.toString()
-                                                        + "/"
-                                                        + fpath.split("/")[0]);
+                                                        + File.separator
+                                                        + targetPath.split(File.separator)[0]);
                                                 while(baseTest.exists()) {
                                                     newDirIdx += 1;
                                                     baseTest = new File(tempZipDir
-                                                            + "/"
+                                                            + File.separator
                                                             + newDirIdx.toString()
-                                                            + "/"
-                                                            + fpath.split("/")[0]);
+                                                            + File.separator
+                                                            + targetPath.split(File.separator)[0]);
                                                 }
                                                 newDir = newDirIdx.toString();
                                                 break;
@@ -599,8 +619,8 @@ public class PixelBufferVerticle extends AbstractVerticle {
                                         String newZipName = zipName;
                                         for (String fpath : filePaths) {
                                             //TODO: Check for duplicate Omero 4.4 images
-                                            String fileName = fpath.split("/")[fpath.split("/").length - 1];
-                                            String temp_f = getTargetPath(fpath, fileName, templatePrefix);
+                                            String fileName = fpath.split(File.separator)[fpath.split(File.separator).length - 1];
+                                            String temp_f = getTargetPath(fpath, fileName, templatePrefix, managedRepositoryRoot);
                                             Path tempfPath = Paths.get(tempZipDir, newDir, temp_f);
                                             File temp_d = new File(tempfPath.getParent().toString());
                                             if (!temp_d.exists()) {
@@ -616,7 +636,6 @@ public class PixelBufferVerticle extends AbstractVerticle {
                                             }
 
                                             Path originalPath = Paths.get(fpath);
-                                            log.info("Copying " + originalPath.toString() + " to " + tempfPath.toString());
                                             Files.copy(originalPath, tempfPath, StandardCopyOption.REPLACE_EXISTING);
                                         }
 
@@ -649,6 +668,7 @@ public class PixelBufferVerticle extends AbstractVerticle {
     private void getZippedFilesMultiple(Message<JsonObject> message) {
         JsonObject messageBody = message.body();
         String sessionKey = messageBody.getString("sessionKey");
+        String zipDirectory = messageBody.getString("zipDirectory");
         JsonArray imageIdArray = messageBody.getJsonArray("imageIds");
         Deque<Long> remainingImageIds = new ArrayDeque<Long>(imageIdArray.size());
         for(int i = 0; i < imageIdArray.size(); i++) {
@@ -657,7 +677,7 @@ public class PixelBufferVerticle extends AbstractVerticle {
 
         log.info(remainingImageIds.toString());
 
-        String tempZipDir = "testTmpZipDir";
+        String tempZipDir = zipDirectory + File.separator + "testTmpZipDir";
         String zipName = "testZip.zip";
         Set<Long> usedFilesetIds = new HashSet<Long>();
         Set<Long> usedFileIds = new HashSet<Long>();
