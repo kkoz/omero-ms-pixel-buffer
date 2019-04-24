@@ -30,6 +30,8 @@ import java.util.Optional;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
+import org.perf4j.StopWatch;
+import org.perf4j.slf4j.Slf4JStopWatch;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.ApplicationContext;
 import org.springframework.context.support.ClassPathXmlApplicationContext;
@@ -263,6 +265,8 @@ public class PixelBufferMicroserviceVerticle extends AbstractVerticle {
         TileCtx tileCtx = new TileCtx(
                 request.params(), event.get("omero.session_key"));
 
+        StopWatch t0 = new Slf4JStopWatch(
+                "PixelBufferMicroserviceVerticle.getTile");
         final HttpServerResponse response = event.response();
 
         vertx.eventBus().<byte[]>send(
@@ -278,7 +282,8 @@ public class PixelBufferMicroserviceVerticle extends AbstractVerticle {
                                 statusCode = ((ReplyException) t).failureCode();
                             }
                             if (statusCode < 1) {
-                                log.error("Unexpected failure code {} setting 500 ", t);
+                                log.error("Unexpected failure code {} setting 500 ",
+                                          statusCode, t);
                                 statusCode = 500;
                             }
                             if (!response.closed()) {
@@ -309,6 +314,7 @@ public class PixelBufferMicroserviceVerticle extends AbstractVerticle {
                         }
                     } finally {
                         log.debug("Response ended");
+                        t0.stop();
                     }
                 }
             }

@@ -25,6 +25,7 @@ import java.nio.ByteBuffer;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
 import loci.common.ByteArrayHandle;
@@ -93,14 +94,19 @@ public class TileRequestHandler {
     }
 
     public CompletableFuture<byte[]> getTile(String omeroSessionKey, Long imageId) {
-        log.info("In TileRequestHandler::getTIle");
-        StopWatch t0 = new Slf4JStopWatch("getTile");
+        StopWatch t0 = new Slf4JStopWatch("TileRequestHandler.getTile");
         CompletableFuture<byte[]> promise = new CompletableFuture<byte[]>();
         getPixels(omeroSessionKey, tileCtx.imageId)
-        .thenAccept(new Consumer<Pixels>() {
+        .whenComplete(new BiConsumer<Pixels, Throwable>() {
             @Override
-            public void accept(Pixels pixels) {
+            public void accept(Pixels pixels, Throwable error) {
                 log.info("In getPixels callback");
+                if (error != null) {
+                    log.error("Error getting pixels from backbone", error);
+                    promise.completeExceptionally(error);
+                    t0.stop();
+                    return;
+                }
                 if (pixels != null) {
                     try (PixelBuffer pixelBuffer = pixelsService.getPixelBuffer(pixels, false)) {
                         String format = tileCtx.format;
@@ -120,10 +126,14 @@ public class TileRequestHandler {
                                 pixels.getPixelsType().getBitSize() / 8;
                         int tileSize = width * height * bytesPerPixel;
                         byte[] tile = new byte[tileSize];
-                        pixelBuffer.getTileDirect(
-                            tileCtx.z, tileCtx.c, tileCtx.t,
-                            region.getX(), region.getY(), width, height, tile);
-
+                        StopWatch t1 = new Slf4JStopWatch("getTileDirect");
+                        try {
+                            pixelBuffer.getTileDirect(
+                                tileCtx.z, tileCtx.c, tileCtx.t,
+                                region.getX(), region.getY(), width, height, tile);
+                        } finally {
+                            t1.stop();
+                        }
                         log.debug(
                                 "Image:{}, z: {}, c: {}, t: {}, resolution: {}, " +
                                 "region: {}, format: {}",
@@ -134,12 +144,16 @@ public class TileRequestHandler {
 
                             if (format.equals("png") || format.equals("tif")) {
                                 promise.complete(writeImage(format, tile, metadata));
+                                t0.stop();
                             } else {
                                 log.error("Unknown output format: {}", format);
                                 promise.complete(null);
+                                t0.stop();
                             }
+                        } else {
+                            promise.complete(tile);
+                            t0.stop();
                         }
-                        promise.complete(tile);
                     }
                     catch(IOException | EnumerationException
                             | FormatException e) {
@@ -160,23 +174,28 @@ public class TileRequestHandler {
      */
     private IMetadata createMetadata(Pixels pixels)
             throws EnumerationException {
-        IMetadata metadata = MetadataTools.createOMEXMLMetadata();
-        metadata.setImageID("Image:0", 0);
-        metadata.setPixelsID("Pixels:0", 0);
-        metadata.setChannelID("Channel:0:0", 0, 0);
-        metadata.setChannelSamplesPerPixel(new PositiveInteger(1), 0, 0);
-        metadata.setPixelsBigEndian(true, 0);
-        metadata.setPixelsSizeX(
-                new PositiveInteger(tileCtx.region.getWidth()), 0);
-        metadata.setPixelsSizeY(
-                new PositiveInteger(tileCtx.region.getHeight()), 0);
-        metadata.setPixelsSizeZ(new PositiveInteger(1), 0);
-        metadata.setPixelsSizeC(new PositiveInteger(1), 0);
-        metadata.setPixelsSizeT(new PositiveInteger(1), 0);
-        metadata.setPixelsDimensionOrder(DimensionOrder.XYCZT, 0);
-        metadata.setPixelsType(PixelType.fromString(
-                pixels.getPixelsType().getValue()), 0);
-        return metadata;
+        StopWatch t0 = new Slf4JStopWatch("createMetadata");
+        try {
+            IMetadata metadata = MetadataTools.createOMEXMLMetadata();
+            metadata.setImageID("Image:0", 0);
+            metadata.setPixelsID("Pixels:0", 0);
+            metadata.setChannelID("Channel:0:0", 0, 0);
+            metadata.setChannelSamplesPerPixel(new PositiveInteger(1), 0, 0);
+            metadata.setPixelsBigEndian(true, 0);
+            metadata.setPixelsSizeX(
+                    new PositiveInteger(tileCtx.region.getWidth()), 0);
+            metadata.setPixelsSizeY(
+                    new PositiveInteger(tileCtx.region.getHeight()), 0);
+            metadata.setPixelsSizeZ(new PositiveInteger(1), 0);
+            metadata.setPixelsSizeC(new PositiveInteger(1), 0);
+            metadata.setPixelsSizeT(new PositiveInteger(1), 0);
+            metadata.setPixelsDimensionOrder(DimensionOrder.XYCZT, 0);
+            metadata.setPixelsType(PixelType.fromString(
+                    pixels.getPixelsType().getValue()), 0);
+            return metadata;
+        } finally {
+            t0.stop();
+        }
     }
 
     /**
@@ -187,6 +206,7 @@ public class TileRequestHandler {
             throws FormatException, IOException {
         String id = System.currentTimeMillis() + "." + extension;
         ByteArrayHandle handle = new ByteArrayHandle();
+        StopWatch t0 = new Slf4JStopWatch("writeImage");
         try (ImageWriter writer = new ImageWriter()) {
             writer.setMetadataRetrieve(metadata);
             Location.mapFile(id, handle);
@@ -202,6 +222,7 @@ public class TileRequestHandler {
         } finally {
             Location.mapFile(id, null);
             handle.close();
+            t0.stop();
         }
     }
 
@@ -213,7 +234,7 @@ public class TileRequestHandler {
         data.put("sessionKey", omeroSessionKey);
         data.put("imageId", imageId);
         vertx.eventBus().<byte[]>send(
-                GET_PIXELS_EVENT, data, new Handler<AsyncResult<Message<byte[]>>>() {
+                GET_PIXELS_DESCRIPTION_EVENT, data, new Handler<AsyncResult<Message<byte[]>>>() {
                     @Override
                     public void handle(AsyncResult<Message<byte[]>> result) {
 
@@ -221,6 +242,7 @@ public class TileRequestHandler {
                     String s = "";
                     try {
                         if (result.failed()) {
+                            log.error("getPixels backbone result failed");
                             promise.completeExceptionally(result.cause());
                             return;
                         }
@@ -228,6 +250,7 @@ public class TileRequestHandler {
                                 new ByteArrayInputStream(result.result().body());
                         ObjectInputStream ois = new ObjectInputStream(bais);
                         Pixels pixels = (Pixels) ois.readObject();
+                        log.info("Completing getPixels promise");
                         promise.complete(pixels);
                     } catch (IOException | ClassNotFoundException e) {
                         promise.completeExceptionally(e);
